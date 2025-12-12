@@ -1,0 +1,303 @@
+<?php
+/*
+Plugin Name: Floating Radio Slot Machine (Stream + Stinger + Rotation + Sweeper)
+Description: Plays: stream → random stinger → 3 rotation → 1 sweeper → loop. Supports ABSPATH MP3 paths, Manila timezone, hidden URLs in JS.
+Version: 5.0
+Author: LS Pilipinas
+*/
+
+if (!defined('ABSPATH')) exit;
+
+/*----------------------------------------
+  Manila timezone
+----------------------------------------*/
+@date_default_timezone_set('Asia/Manila');
+
+/*----------------------------------------
+  ADMIN MENU
+----------------------------------------*/
+add_action('admin_menu', function() {
+    add_menu_page(
+        'Radio Slot Machine',
+        'Radio Slot Machine',
+        'manage_options',
+        'floating-radio-button',
+        'frb_admin_page',
+        'dashicons-format-audio',
+        90
+    );
+});
+
+/*----------------------------------------
+  ADMIN PAGE
+----------------------------------------*/
+function frb_admin_page() {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['frb_settings_nonce'])) {
+        if ( wp_verify_nonce($_POST['frb_settings_nonce'], 'frb_save_settings') ) {
+            if ( isset($_POST['frb_stream_url']) ) {
+                update_option('frb_stream_url', esc_url_raw(trim($_POST['frb_stream_url'])));
+            }
+            echo '<div class="updated"><p>Settings Saved.</p></div>';
+        } else {
+            echo '<div class="error"><p>Security check failed.</p></div>';
+        }
+    }
+
+    $stream_url = get_option('frb_stream_url','');
+    ?>
+<div class="wrap">
+    <h1>Radio Slot Machine v5.0</h1>
+    <form method="post">
+        <?php wp_nonce_field('frb_save_settings', 'frb_settings_nonce'); ?>
+        <h2>Streaming URL</h2>
+        <input type="url" name="frb_stream_url" value="<?php echo esc_attr($stream_url); ?>" 
+               style="width:80%;" placeholder="">
+        <p class="description">Main streaming URL to play first. If not set, a random MP3 will play.</p>
+        <p style="margin-top:20px;">
+            <input type="submit" class="button button-primary" value="Save Settings">
+        </p>
+    </form>
+</div>
+    <?php
+}
+
+/*----------------------------------------
+  FRONTEND BUTTON + AUDIO
+----------------------------------------*/
+add_action('wp_footer', function() {
+?>
+<div id="frb-button" style="position:fixed;bottom:20px;right:20px;width:80px;height:80px;background:#e62d37;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:99999;">
+    <svg id="frb-icon" xmlns="http://www.w3.org/2000/svg" fill="#fff" viewBox="0 0 24 24" width="40" height="40">
+        <path d="M8 5v14l11-7z"/>
+    </svg>
+</div>
+
+<audio id="frb-audio" preload="auto"></audio>
+<audio id="frb-audio-next" preload="auto" style="display:none;"></audio>
+
+<script>
+(function(){
+    const audio = document.getElementById("frb-audio");
+    const audioNext = document.getElementById("frb-audio-next"); // for crossfade
+    const playButton = document.getElementById("frb-button");
+    const icon = document.getElementById("frb-icon");
+
+    let playing = false;
+    let playlist = [];
+    let lastPlayedTrack = null;
+    let stingerQueue = [];
+    let sweeperQueue = [];
+    let rotationQueue = [];
+    let currentSlot = null;
+    let songCounter = 0;
+    let sweeperCounter = 0;
+    const CROSSFADE_DURATION = 2.5; // seconds
+
+    function getCurrentSlot(){
+        const h = new Date().getHours();
+        if(h>=6 && h<=11) return 'morning';
+        if(h>=12 && h<=17) return 'afternoon';
+        if(h>=18 && h<=23) return 'evening';
+        return 'midnight';
+    }
+
+    function shuffleArray(arr){
+        for(let i=arr.length-1;i>0;i--){
+            const j=Math.floor(Math.random()*(i+1));
+            [arr[i],arr[j]]=[arr[j],arr[i]];
+        }
+    }
+
+    async function getFrbConfig(){
+        try{
+            const resp = await fetch("<?php echo admin_url('admin-ajax.php'); ?>?action=get_frb_config");
+            return await resp.json();
+        }catch(err){
+            console.error("[FRB] Config fetch failed:", err);
+            return { stream:'' };
+        }
+    }
+
+    function buildSlotQueues(frbConfig, slot){
+        if(currentSlot!==slot){
+            currentSlot = slot;
+            songCounter = 0;
+            sweeperCounter = 0;
+            lastPlayedTrack = null;
+        }
+
+        const slotData = frbConfig[slot] || {stingers:[], sweepers:[], rotation:[]};
+
+        // Stinger first
+        stingerQueue = slotData.stingers.slice();
+        shuffleArray(stingerQueue);
+
+        // Sweepers
+        sweeperQueue = slotData.sweepers.slice();
+        shuffleArray(sweeperQueue);
+
+        // Rotations
+        rotationQueue = slotData.rotation.slice();
+        shuffleArray(rotationQueue);
+
+        // Build initial playlist: stinger first
+        playlist = [];
+        if(stingerQueue.length) playlist.push(stingerQueue.shift());
+        playlist = playlist.concat(rotationQueue);
+    }
+
+    function crossfadePlay(current, next){
+        let step = 0.05;
+        let interval = 50;
+        let fadeSteps = CROSSFADE_DURATION*1000/interval;
+        next.volume=0;
+        next.play();
+        const fadeInterval = setInterval(()=>{
+            if(current.volume>0){
+                current.volume = Math.max(0,current.volume-step);
+                next.volume = Math.min(1,next.volume+step);
+            } else {
+                current.pause();
+                current.volume=1.0;
+                clearInterval(fadeInterval);
+            }
+        },interval);
+    }
+
+    function playNextTrack(){
+        if(!playlist.length) return;
+
+        let nextTrack = null;
+
+        // Insert sweeper every 3 songs
+        if(songCounter>=3 && sweeperQueue.length){
+            nextTrack = sweeperQueue.shift();
+            songCounter=0;
+            sweeperCounter++;
+        } else {
+            nextTrack = playlist.shift();
+            songCounter++;
+        }
+
+        lastPlayedTrack = nextTrack;
+
+        // Crossfade with next audio
+        if(audio.paused){
+            audio.src = nextTrack;
+            audio.volume=1.0;
+            audio.play();
+        } else {
+            audioNext.src = nextTrack;
+            crossfadePlay(audio, audioNext);
+            // swap audio elements
+            const tmp=audioNext; audioNext=audio; audio=tmp;
+        }
+
+        audio.onended = playNextTrack;
+    }
+
+    async function startSlotPlayback(slot){
+        const frbConfig = await getFrbConfig();
+        buildSlotQueues(frbConfig, slot);
+
+        if(frbConfig.stream){
+            audio.src = frbConfig.stream;
+            audio.volume=1.0;
+            audio.play().then(()=>{
+                audio.onended = playNextTrack;
+            }).catch(()=>{ playNextTrack(); });
+        } else {
+            playNextTrack();
+        }
+    }
+
+    playButton.addEventListener("click", ()=>{
+        if(!playing){
+            playing=true;
+            icon.innerHTML="<path d='M6 19h4V5H6v14zM14 5v14h4V5h-4z'/>";
+            startSlotPlayback(getCurrentSlot());
+        } else {
+            playing=false;
+            audio.pause();
+            audioNext.pause();
+            icon.innerHTML="<path d='M8 5v14l11-7z'/>";
+        }
+    });
+
+})();
+</script>
+
+
+
+<style>
+@media (max-width:768px){
+    #frb-button{
+        width:70px !important;
+        height:70px !important;
+        bottom:10px !important;
+        left:50% !important;
+        transform:translateX(-50%) !important;
+        z-index:999999 !important;
+    }
+}
+</style>
+
+<?php
+});
+
+/*----------------------------------------
+  Helper: list mp3 files case-insensitively
+----------------------------------------*/
+function frb_list_mp3_files_in_dir($dir_path) {
+    $out = [];
+    if (!is_dir($dir_path)) return $out;
+    $files = scandir($dir_path);
+    if (!$files) return $out;
+    foreach ($files as $f){
+        if ($f === '.' || $f === '..') continue;
+        if (preg_match('/\.mp3$/i', $f)) $out[] = $dir_path . $f;
+    }
+    return $out;
+}
+
+/*----------------------------------------
+  AJAX CONFIG
+----------------------------------------*/
+add_action('wp_ajax_get_frb_config','frb_get_config');
+add_action('wp_ajax_nopriv_get_frb_config','frb_get_config');
+
+function frb_get_config(){
+    $slots = ['morning','afternoon','evening','midnight'];
+    $today = strtolower(date('l'));
+    $base_url = site_url('/'); // adjust if WP installed in subfolder
+    $frbConfig = [
+        'stream' => get_option('frb_stream_url',''),
+        'server_day' => $today
+    ];
+
+    foreach($slots as $slot){
+        $rotation_folder = ABSPATH.'mp3'.DIRECTORY_SEPARATOR.$slot.DIRECTORY_SEPARATOR.$today.DIRECTORY_SEPARATOR;
+        $stinger_folder  = ABSPATH.'mp3'.DIRECTORY_SEPARATOR.'stinger'.DIRECTORY_SEPARATOR;
+        $sweeper_folder  = ABSPATH.'mp3'.DIRECTORY_SEPARATOR.'sweeper'.DIRECTORY_SEPARATOR;
+
+        $rotation_files = frb_list_mp3_files_in_dir($rotation_folder);
+        $stinger_files  = frb_list_mp3_files_in_dir($stinger_folder);
+        $sweeper_files  = frb_list_mp3_files_in_dir($sweeper_folder);
+
+        shuffle($rotation_files);
+        shuffle($stinger_files);
+        shuffle($sweeper_files);
+
+        $frbConfig[$slot] = [
+            'rotation' => array_map(fn($f)=> $base_url.'mp3/'.$slot.'/'.$today.'/'.rawurlencode(basename($f)), $rotation_files),
+            'stingers' => array_map(fn($f)=> $base_url.'mp3/stinger/'.rawurlencode(basename($f)), $stinger_files),
+            'sweepers' => array_map(fn($f)=> $base_url.'mp3/sweeper/'.rawurlencode(basename($f)), $sweeper_files)
+        ];
+    }
+
+    if (defined('WP_DEBUG') && WP_DEBUG){
+        error_log("FRB → get_frb_config called (server_day={$today})");
+    }
+
+    wp_send_json($frbConfig);
+}
