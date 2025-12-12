@@ -1,0 +1,309 @@
+<?php
+/*
+Plugin Name: Floating Radio Slot Machine (Stream + Stinger + Rotation) - AJAX Hidden
+Description: Stream -> one random stinger (once) -> rotation MP3s per slot/day. Handles mixed-case filenames, uses ABSPATH for file lookups and site_url() for public URLs. Manila timezone enforced.
+Version: 4.0
+Author: LS Pilipinas
+*/
+
+if (!defined('ABSPATH')) exit;
+
+/*----------------------------------------
+  Ensure server uses Manila timezone
+----------------------------------------*/
+@date_default_timezone_set('Asia/Manila');
+
+/*----------------------------------------
+  ADMIN MENU
+----------------------------------------*/
+add_action('admin_menu', function() {
+    add_menu_page(
+        'Radio Slot Machine',
+        'Radio Slot Machine',
+        'manage_options',
+        'floating-radio-button',
+        'frb_admin_page',
+        'dashicons-format-audio',
+        90
+    );
+});
+
+/*----------------------------------------
+  ADMIN PAGE
+----------------------------------------*/
+function frb_admin_page() {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['frb_settings_nonce'])) {
+        if ( wp_verify_nonce($_POST['frb_settings_nonce'], 'frb_save_settings') ) {
+            if ( isset($_POST['frb_stream_url']) ) {
+                update_option('frb_stream_url', esc_url_raw(trim($_POST['frb_stream_url'])));
+            }
+            echo '<div class="updated"><p>Settings Saved.</p></div>';
+        } else {
+            echo '<div class="error"><p>Security check failed.</p></div>';
+        }
+    }
+
+    $stream_url = get_option('frb_stream_url','');
+    ?>
+<div class="wrap">
+    <h1>Radio Slot Machine v1.4</h1>
+
+    <form method="post">
+        <?php wp_nonce_field('frb_save_settings', 'frb_settings_nonce'); ?>
+        <h2>Streaming URL</h2>
+        <input type="url" name="frb_stream_url" value="<?php echo esc_attr($stream_url); ?>" 
+               style="width:80%;" placeholder="">
+        <p class="description">Main streaming URL to play first. If not set, a random MP3 will play.</p>
+        <p style="margin-top:20px;">
+            <input type="submit" class="button button-primary" value="Save Settings">
+        </p>
+    </form>
+</div>
+    <?php
+}
+
+/*----------------------------------------
+  FRONTEND — BUTTON + AUDIO (JS)
+----------------------------------------*/
+add_action('wp_footer', function() {
+    // embed minimal JS with stinger-once logic
+?>
+<div id="frb-button" style="position:fixed;bottom:20px;right:20px;width:80px;height:80px;background:#e62d37;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:99999;">
+    <svg id="frb-icon" xmlns="http://www.w3.org/2000/svg" fill="#fff" viewBox="0 0 24 24" width="40" height="40">
+        <path d="M8 5v14l11-7z"/>
+    </svg>
+</div>
+
+<audio id="frb-audio" preload="auto"></audio>
+
+<script>
+(function(){
+    const audio = document.getElementById("frb-audio");
+    const icon = document.getElementById("frb-icon");
+    const playButton = document.getElementById("frb-button");
+
+    let playing = false;
+    let playlist = [];
+    let lastPlayedTrack = null;
+    let selectedStinger = null; // chosen once per session/slot
+    let currentSlot = null;
+
+    function getCurrentSlot(){
+        const h = new Date().getHours();
+        if(h>=6 && h<=11) return 'morning';
+        if(h>=12 && h<=17) return 'afternoon';
+        if(h>=18 && h<=23) return 'evening';
+        return 'midnight';
+    }
+
+    function shuffleArray(arr){
+        for(let i=arr.length-1;i>0;i--){
+            const j=Math.floor(Math.random()*(i+1));
+            [arr[i],arr[j]]=[arr[j],arr[i]];
+        }
+    }
+
+    async function getFrbConfig(){
+        try{
+            const resp = await fetch("<?php echo admin_url('admin-ajax.php'); ?>?action=get_frb_config");
+            return await resp.json();
+        } catch(err){
+            console.error("[FRB] Config fetch failed:", err);
+            return { stream: '' };
+        }
+    }
+
+    function buildSlotPlaylist(slot, frbConfig){
+        // reset selectedStinger if slot changed
+        if(currentSlot !== slot){
+            selectedStinger = null;
+            lastPlayedTrack = null;
+            currentSlot = slot;
+        }
+
+        const today = new Date().toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+        console.log(`[FRB] Slot: ${slot}, Day: ${today}`);
+
+        const slotData = frbConfig[slot] || { stingers: [], rotation: [] };
+        // pick ONE random stinger only if not selected yet
+        if(!selectedStinger && slotData.stingers && slotData.stingers.length){
+            // filter out previously-used stinger if you want—here we just choose random
+            selectedStinger = slotData.stingers[Math.floor(Math.random()*slotData.stingers.length)];
+            console.log("[FRB] Selected stinger (once):", selectedStinger);
+        }
+
+        const rotation = Array.isArray(slotData.rotation) ? slotData.rotation.slice() : [];
+        shuffleArray(rotation);
+
+        // playlist: stinger first (if selected), then rotation
+        playlist = [];
+        if(selectedStinger){
+            playlist.push(selectedStinger);
+        }
+        playlist = playlist.concat(rotation);
+
+        console.log("[FRB] Playlist length:", playlist.length);
+        if(playlist.length === 0){
+            console.warn("[FRB] No tracks found for slot:", slot);
+        }
+    }
+
+    function playNextTrack(){
+        if(!playlist.length){
+            console.warn("[FRB] No tracks to play.");
+            return;
+        }
+        let available = playlist.filter(t => t !== lastPlayedTrack);
+        const track = available.length ? available[Math.floor(Math.random()*available.length)] : playlist[0];
+        lastPlayedTrack = track;
+
+        console.log("[FRB] Now playing:", track);
+        audio.src = track;
+        audio.load();
+        audio.volume = 1.0;
+        audio.play().catch(()=>setTimeout(playNextTrack, 300));
+        audio.onended = playNextTrack;
+    }
+
+    function playStream(slot, streamUrl, frbConfig){
+        if(!streamUrl){
+            buildSlotPlaylist(slot, frbConfig);
+            playNextTrack();
+            return;
+        }
+        console.log("[FRB] Attempting stream:", streamUrl);
+        audio.src = streamUrl;
+        audio.load();
+        audio.volume = 1.0;
+
+        audio.play().then(()=>{
+            console.log("[FRB] Stream playing");
+            audio.onended = ()=>{
+                console.log("[FRB] Stream ended, fallback to MP3");
+                buildSlotPlaylist(slot, frbConfig);
+                playNextTrack();
+            };
+        }).catch(()=>{
+            console.log("[FRB] Stream failed, fallback to MP3");
+            buildSlotPlaylist(slot, frbConfig);
+            playNextTrack();
+        });
+    }
+
+    async function startSlotPlayback(slot){
+        const frbConfig = await getFrbConfig();
+        // server_day included for debugging/time alignment
+        if(frbConfig.server_day) console.log("[FRB] Server day:", frbConfig.server_day);
+        const streamUrl = frbConfig.stream || '';
+        playStream(slot, streamUrl, frbConfig);
+    }
+
+    playButton.addEventListener("click", ()=>{
+        if(!playing){
+            playing = true;
+            icon.innerHTML = "<path d='M6 19h4V5H6v14zM14 5v14h4V5h-4z'/>";
+            startSlotPlayback(getCurrentSlot());
+        } else {
+            playing = false;
+            audio.pause();
+            icon.innerHTML = "<path d='M8 5v14l11-7z'/>";
+            console.log("[FRB] Playback paused");
+        }
+    });
+})();
+</script>
+
+<style>
+@media (max-width:768px){
+    #frb-button{
+        width:70px !important;
+        height:70px !important;
+        bottom:10px !important;
+        left:50% !important;
+        transform:translateX(-50%) !important;
+        z-index:999999 !important;
+    }
+}
+</style>
+
+<?php
+});
+
+/*----------------------------------------
+  Helper: list mp3 files case-insensitively (mixed-case support)
+----------------------------------------*/
+function frb_list_mp3_files_in_dir($dir_path) {
+    $out = [];
+    if (!is_dir($dir_path)) return $out;
+    $files = scandir($dir_path);
+    if (!$files) return $out;
+    foreach ($files as $f) {
+        if ($f === '.' || $f === '..') continue;
+        // match .mp3 case-insensitively
+        if (preg_match('/\.mp3$/i', $f)) {
+            $out[] = $dir_path . $f; // full filesystem path
+        }
+    }
+    return $out;
+}
+
+/*----------------------------------------
+  AJAX HANDLER
+----------------------------------------*/
+add_action('wp_ajax_get_frb_config','frb_get_config');
+add_action('wp_ajax_nopriv_get_frb_config','frb_get_config');
+
+function frb_get_config(){
+    $slots = ['morning','afternoon','evening','midnight'];
+    $today = strtolower(date('l')); // Manila timezone set above
+    $base_url = site_url('/'); // expects site_url to include subdir like /main/
+    $frbConfig = [
+        'stream'     => get_option('frb_stream_url',''),
+        'server_day' => $today
+    ];
+
+    foreach($slots as $slot){
+        // filesystem folder paths using ABSPATH; ensure trailing slash
+        $rotation_folder = rtrim(ABSPATH, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'mp3' . DIRECTORY_SEPARATOR . $slot . DIRECTORY_SEPARATOR . $today . DIRECTORY_SEPARATOR;
+        $stinger_folder  = rtrim(ABSPATH, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'mp3' . DIRECTORY_SEPARATOR . $slot . DIRECTORY_SEPARATOR;
+
+        $rotation_arr = [];
+        $stingers_arr = [];
+
+        // rotation files (mixed-case safe)
+        $rotation_files = frb_list_mp3_files_in_dir($rotation_folder);
+        if (!empty($rotation_files)) {
+            shuffle($rotation_files);
+            foreach ($rotation_files as $f) {
+                $rotation_arr[] = $base_url . 'mp3/' . $slot . '/' . $today . '/' . rawurlencode(basename($f));
+            }
+        }
+
+        // stinger files (mixed-case safe)
+        $stinger_files = frb_list_mp3_files_in_dir($stinger_folder);
+        if (!empty($stinger_files)) {
+            shuffle($stinger_files);
+            foreach ($stinger_files as $f) {
+                $stingers_arr[] = $base_url . 'mp3/' . $slot . '/' . rawurlencode(basename($f));
+            }
+        }
+
+        $frbConfig[$slot] = [
+            'stingers' => array_values($stingers_arr),
+            'rotation' => array_values($rotation_arr)
+        ];
+    }
+
+    // server-side debug when WP_DEBUG is enabled
+    if (defined('WP_DEBUG') && WP_DEBUG) {
+        error_log("FRB → get_frb_config called (server_day={$today})");
+        foreach (['morning','afternoon','evening','midnight'] as $s) {
+            $c_st = isset($frbConfig[$s]['stingers']) ? count($frbConfig[$s]['stingers']) : 0;
+            $c_rt = isset($frbConfig[$s]['rotation']) ? count($frbConfig[$s]['rotation']) : 0;
+            error_log("FRB → slot {$s}: stingers={$c_st} rotation={$c_rt}");
+        }
+    }
+
+    wp_send_json($frbConfig);
+}
+?>
